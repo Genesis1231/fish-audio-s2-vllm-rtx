@@ -7,7 +7,7 @@
   "api_key": null,
   "defaults": {
     "format": "wav",
-    "max_new_tokens": 1024,
+    "max_new_tokens": 4096,
     "stream_sentence_gap_ms": 600
   }
 }

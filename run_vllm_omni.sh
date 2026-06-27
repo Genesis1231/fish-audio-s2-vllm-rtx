@@ -7,10 +7,28 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODELS="$(cd "$DIR/../models" && pwd)"
 NAME=vllm_omni_s2
 IMAGE=vllm-omni-fish:local
 PORT=8091
+
+if [ ! -d "$DIR/../models/s2-pro" ]; then
+  echo "[vllm-omni] error: model weights not found at $DIR/../models/s2-pro" >&2
+  echo "            download them (see README, huggingface.co/fishaudio/s2-pro) and retry." >&2
+  exit 1
+fi
+MODELS="$(cd "$DIR/../models" && pwd)"
+
+# If a container already exists but was built from a DIFFERENT image than the
+# current $IMAGE (i.e. you rebuilt vllm-omni-fish:local), recreate it — otherwise
+# `docker start` below would silently resurrect the old image and old serve args.
+if docker inspect "$NAME" >/dev/null 2>&1; then
+  want="$(docker inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
+  have="$(docker inspect -f '{{.Image}}' "$NAME" 2>/dev/null || true)"
+  if [ -n "$want" ] && [ "$want" != "$have" ]; then
+    echo "[vllm-omni] image changed since this container was created — recreating..."
+    docker rm -f "$NAME" >/dev/null
+  fi
+fi
 
 if docker ps --format '{{.Names}}' | grep -q "^${NAME}$"; then
   echo "[vllm-omni] already running"

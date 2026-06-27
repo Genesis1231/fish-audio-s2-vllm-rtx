@@ -15,7 +15,6 @@ Endpoints
 Run:  ./run.sh           (or: uvicorn server:app --host 0.0.0.0 --port 8765)
 """
 
-import functools
 import io
 import shutil
 import struct
@@ -240,6 +239,10 @@ def _ffmpeg_stream(pcm_chunks, sample_rate: int, fmt: str):
                 proc.stdin.write(chunk)
         except (BrokenPipeError, ValueError, OSError):
             pass                                   # ffmpeg gone / client disconnected
+        except Exception:
+            # A backend failure mid-stream (after the 200) can't change the
+            # status, but it must not vanish silently — log it so it's diagnosable.
+            logger.exception("compressed stream aborted: backend error mid-render")
         finally:
             try:
                 proc.stdin.close()
@@ -266,11 +269,11 @@ def _ffmpeg_stream(pcm_chunks, sample_rate: int, fmt: str):
         feeder.join(timeout=1)
 
 
-def _stream(text, voice, params, ref_audio, ref_text, fmt):
-    """Sync generator of encoded audio as it renders: raw PCM, a sentinel-header
-    WAV stream, or a live ffmpeg-encoded compressed stream (mp3/opus/flac/…)."""
-    pcm = (_pcm16(seg) for seg in
-           engine.generate_stream(text, voice, params, ref_audio, ref_text))
+def _stream(segments, fmt):
+    """Sync generator of encoded audio as it renders, over an already-opened
+    stream of float32 segments: raw PCM, a sentinel-header WAV stream, or a live
+    ffmpeg-encoded compressed stream (mp3/opus/flac/…)."""
+    pcm = (_pcm16(seg) for seg in segments)
     if fmt == "pcm":
         yield from pcm
     elif fmt == "wav":
@@ -278,6 +281,21 @@ def _stream(text, voice, params, ref_audio, ref_text, fmt):
         yield from pcm
     else:
         yield from _ffmpeg_stream(pcm, engine.sample_rate, fmt)
+
+
+async def _stream_response(text, voice, params, ref_audio, ref_text, fmt) -> StreamingResponse:
+    """Open the upstream stream EAGERLY in a worker thread, then wrap it.
+
+    engine.generate_stream validates the backend response (status, unknown
+    voice, reachability) before returning its iterator, so those failures raise
+    here — mapped to a real 400/404/502 by the exception handlers — instead of
+    surfacing as a 200 with empty audio once StreamingResponse has started. The
+    threadpool keeps that blocking connect (and the reference decode that
+    precedes it) off the event loop."""
+    segments = await run_in_threadpool(
+        engine.generate_stream, text, voice, params, ref_audio, ref_text)
+    return StreamingResponse(_stream(segments, fmt),
+                             media_type=MEDIA_TYPES[fmt], headers=STREAM_HEADERS)
 
 
 # ---- app -----------------------------------------------------------------
@@ -296,10 +314,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Fish Studio TTS", version="1.0", lifespan=lifespan)
 
 
-@functools.lru_cache(maxsize=1)
+_gpu_name_cache: Optional[str] = None
+
+
 def _gpu_name() -> Optional[str]:
-    """GPU name via nvidia-smi (cached). Avoids importing torch into this
-    lightweight, GPU-less proxy just to label /health."""
+    """GPU name via nvidia-smi. Avoids importing torch into this lightweight,
+    GPU-less proxy just to label /health. Caches only a *successful* lookup — a
+    transient nvidia-smi failure must not pin /health to gpu:null forever."""
+    global _gpu_name_cache
+    if _gpu_name_cache is not None:
+        return _gpu_name_cache
     smi = shutil.which("nvidia-smi")
     if not smi:
         return None
@@ -307,7 +331,8 @@ def _gpu_name() -> Optional[str]:
         out = subprocess.run([smi, "--query-gpu=name", "--format=csv,noheader"],
                              capture_output=True, text=True, timeout=5)
         if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip().splitlines()[0].strip()
+            _gpu_name_cache = out.stdout.strip().splitlines()[0].strip()
+            return _gpu_name_cache
     except Exception:
         pass
     return None
@@ -366,7 +391,7 @@ async def generate(body: SpeakBody, _=Depends(require_key), __=Depends(require_b
     fmt = _validate_format(body.format or DEFAULTS.get("format", "wav"))
     voice = _resolve_voice(body.voice)
     params = _params(body)
-    ref_audio, ref_text = _decode_ref(body)
+    ref_audio, ref_text = await run_in_threadpool(_decode_ref, body)
     data = await run_in_threadpool(_synth_full, text, voice, params, ref_audio, ref_text, fmt)
     return Response(content=data, media_type=MEDIA_TYPES[fmt])
 
@@ -381,15 +406,13 @@ async def stream(body: SpeakBody, _=Depends(require_key), __=Depends(require_bac
         raise HTTPException(400, "empty text")
     fmt = _validate_format(body.format or "pcm")
     voice = _resolve_voice(body.voice)
-    # require_backend already loaded the backend, so the voice list is fresh. Check
-    # it here (not deep in the generator) because a lazy StreamingResponse has
-    # already sent its 200 before the generator runs — too late for a 404.
-    if voice and voice not in engine.list_voices():
-        raise HTTPException(404, f"voice '{voice}' not found")
     params = _params(body)
-    ref_audio, ref_text = _decode_ref(body)
-    gen = _stream(text, voice, params, ref_audio, ref_text, fmt)
-    return StreamingResponse(gen, media_type=MEDIA_TYPES[fmt], headers=STREAM_HEADERS)
+    ref_audio, ref_text = await run_in_threadpool(_decode_ref, body)
+    # No voice-existence pre-check here: _stream_response opens the upstream
+    # request eagerly, so an unknown named voice raises UnknownVoiceError (-> 404)
+    # before the 200 is sent — and an ad-hoc reference correctly takes precedence
+    # over any resolved voice name (a clone request is never wrongly 404'd).
+    return await _stream_response(text, voice, params, ref_audio, ref_text, fmt)
 
 
 @app.post("/v1/audio/speech")
@@ -399,17 +422,18 @@ async def openai_speech(body: OpenAISpeechBody, _=Depends(require_key), __=Depen
     if not text:
         raise HTTPException(400, "empty input")
     fmt = _validate_format(body.response_format or "mp3")
-    # require_backend already refreshed the voice list. Map the voice: use it if we
-    # have it, else fall back to the default so clients sending OpenAI preset names
-    # (alloy, etc.) still get audio.
-    voice = body.voice if body.voice in engine.list_voices() else (DEFAULT_VOICE or None)
+    # Resolve like the native routes ("" -> zero-shot, None -> default voice),
+    # then map an unknown OpenAI preset name (alloy, etc.) to the default so those
+    # clients still get audio instead of a 404.
+    voice = _resolve_voice(body.voice)
+    if voice and voice not in engine.list_voices():
+        voice = DEFAULT_VOICE or None
     params = dict(DEFAULTS)
     if body.speed is not None:
         params["speed"] = body.speed
 
     if body.stream:
-        gen = _stream(text, voice, params, None, None, fmt)
-        return StreamingResponse(gen, media_type=MEDIA_TYPES[fmt], headers=STREAM_HEADERS)
+        return await _stream_response(text, voice, params, None, None, fmt)
 
     data = await run_in_threadpool(_synth_full, text, voice, params, None, None, fmt)
     return Response(content=data, media_type=MEDIA_TYPES[fmt])

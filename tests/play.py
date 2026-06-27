@@ -8,7 +8,8 @@ Playback uses sounddevice (PortAudio). Choose an output with --device/--list-dev
 the default routes through the system sink. Falls back to ffplay if PortAudio is
 missing; --no-play just fetches + measures (headless).
 
-  python tests/play.py                          # stream then generate, default device
+  python tests/play.py                          # Fish's default voice (zero-shot)
+  python tests/play.py --voice samantha         # clone a named voice from voices/
   python tests/play.py --device razer           # target the Razer speaker by name
   python tests/play.py --list-devices
   python tests/play.py --mode stream --text "a longer, multi-sentence line. like this one."
@@ -127,6 +128,8 @@ class StreamPlayer:
             self._pos += n
 
     def write(self, chunk):
+        if not self.backend:                     # --no-play: nothing to render
+            return
         buf = self._rem + chunk
         m = len(buf) - (len(buf) % 2)            # whole int16 frames only
         frames, self._rem = buf[:m], buf[m:]
@@ -140,6 +143,9 @@ class StreamPlayer:
         # known there; here we'd only see arbitrary network packets).
         x = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
         with self._lock:
+            if self._pos > self.sr:                  # reclaim already-played audio so a long
+                self._buf = self._buf[self._pos:]    # stream doesn't grow the buffer without bound
+                self._pos = 0                        # (and each concat stays cheap, not O(n^2))
             self._buf = np.concatenate([self._buf, x])
             ready = len(self._buf) >= self._lead
         if not self._started and ready:          # start once the lead is buffered
@@ -147,6 +153,8 @@ class StreamPlayer:
             self._stream.start()
 
     def close(self):
+        if not self.backend:                     # --no-play: nothing to drain
+            return
         if self.backend == "ffplay":
             try:
                 self._proc.stdin.close()
@@ -223,7 +231,8 @@ def main():
     p = argparse.ArgumentParser(description="Play audio from the Fish Studio TTS service.")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--voice", default="samantha")
+    p.add_argument("--voice", default="",
+                   help="named voice to clone; omit for Fish's built-in default voice (zero-shot)")
     p.add_argument("--text", default="Earlier I was thinking about how I was annoyed. "
                                       "And I know this sounds strange, but honestly, "
                                       "I was really excited about it.")
@@ -246,7 +255,7 @@ def main():
         print(f"[play] cannot reach {base}/health: {e}", file=sys.stderr)
         return 1
 
-    banner(f"Fish Studio TTS demo  —  voice={a.voice}  sr={sr}Hz")
+    banner(f"Fish Studio TTS demo  —  voice={a.voice or 'default (zero-shot)'}  sr={sr}Hz")
     print(f'  text: "{a.text}"')
     backend, sd = (None, None) if a.no_play else pick_backend(a.device)
 
@@ -261,7 +270,8 @@ def main():
     for r in results:
         if r["mode"] == "stream":
             tail = " (played live)" if r["played"] else f", {r['dur']/r['wall']:.2f}x realtime gen"
-            print(f"    stream: {r['dur']:.2f}s audio, first-audio {r['ttfa_ms']:.0f} ms{tail}")
+            ttfa = f"{r['ttfa_ms']:.0f} ms" if r["ttfa_ms"] is not None else "n/a (empty stream)"
+            print(f"    stream: {r['dur']:.2f}s audio, first-audio {ttfa}{tail}")
         else:
             print(f"  generate: {r['dur']:.2f}s audio in {r['wall']:.2f}s "
                   f"({r['dur']/r['wall']:.2f}x realtime)")

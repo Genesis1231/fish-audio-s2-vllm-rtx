@@ -25,11 +25,18 @@ from typing import Iterator, Optional
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
 
 from config import DEFAULT_VOICE, REF_MAX_SECONDS, VLLM_URL, VOICES_DIR, logger
 
 SAMPLE_RATE = 44100          # s2-pro DAC output
 _DEFAULT_GAP_MS = 600        # fallback breathing target if not in params/config
+
+# One pooled HTTP session for all backend calls: keep-alive avoids a fresh TCP
+# connect (and a TIME_WAIT socket) per request, which matters once several
+# streams run concurrently. Session.request is thread-safe for our usage.
+_session = requests.Session()
+_session.mount("http://", HTTPAdapter(pool_connections=8, pool_maxsize=32))
 
 
 class BackendError(Exception):
@@ -109,7 +116,11 @@ class BreathingExtender:
             else:
                 self._pending.append(fr)
                 self._pending_n += len(fr)
-                if self._pending_n >= self.debounce:        # confirmed real speech
+                # Confirm speech once it persists for debounce_ms — EXCEPT the very
+                # first word: there's no pause before it to protect, so holding it
+                # back would only add ~debounce_ms to time-to-first-audio. Emit it
+                # the instant it appears.
+                if not self._started or self._pending_n >= self.debounce:
                     if self._started and self.min_pause <= self._sil < self.target:
                         out.append(np.zeros(self.target - self._sil, dtype=np.float32))
                     self._sil = 0
@@ -160,20 +171,25 @@ class VLLMEngine:
     def load(self) -> float:
         """Connect to vLLM-Omni and make sure our voices are uploaded. Idempotent;
         retried by every request until it succeeds (so the proxy survives the
-        backend starting later)."""
+        backend starting later, or restarting underneath us — see _post, which
+        flips _ready back to False on a connection failure so the next request
+        re-probes and re-syncs the voice list)."""
         if self._ready:
             return 0.0
+        # Probe the backend OUTSIDE the lock: when it's down, N concurrent
+        # requests must not serialize behind one another on a multi-second
+        # timeout (that would exhaust the threadpool and stall /health too).
+        t0 = time.time()
+        try:
+            _session.get(f"{self._base}/v1/models", timeout=3).raise_for_status()
+        except Exception as e:
+            raise RuntimeError(
+                f"vLLM-Omni backend not reachable at {self._base} ({e}). "
+                f"Start it with ./run_vllm_omni.sh"
+            )
         with self._lock:
-            if self._ready:
+            if self._ready:                    # another request synced while we probed
                 return 0.0
-            t0 = time.time()
-            try:
-                requests.get(f"{self._base}/v1/models", timeout=5).raise_for_status()
-            except Exception as e:
-                raise RuntimeError(
-                    f"vLLM-Omni backend not reachable at {self._base} ({e}). "
-                    f"Start it with ./run_vllm_omni.sh"
-                )
             self._load_local_voices()
             self._sync_voices()
             self._ready = True
@@ -225,7 +241,7 @@ class VLLMEngine:
 
     def _vllm_voice_names(self) -> set:
         try:
-            r = requests.get(f"{self._base}/v1/audio/voices", timeout=10)
+            r = _session.get(f"{self._base}/v1/audio/voices", timeout=10)
             r.raise_for_status()
             return set(r.json().get("voices", []))
         except Exception:
@@ -233,7 +249,7 @@ class VLLMEngine:
 
     def _delete_voice(self, name: str) -> None:
         try:
-            requests.delete(f"{self._base}/v1/audio/voices/{name}", timeout=30)
+            _session.delete(f"{self._base}/v1/audio/voices/{name}", timeout=30)
         except Exception:
             logger.exception("voice '%s' delete failed", name)
 
@@ -255,7 +271,7 @@ class VLLMEngine:
                 self._delete_voice(name)
             wav, rtext = _trim_ref(wav_bytes, text, REF_MAX_SECONDS)
             try:
-                r = requests.post(
+                r = _session.post(
                     f"{self._base}/v1/audio/voices",
                     files={"audio_sample": (f"{name}.wav", wav, "audio/wav")},
                     data={"name": name, "ref_text": rtext,
@@ -312,7 +328,15 @@ class VLLMEngine:
         return body
 
     def _post(self, body, stream):
-        r = requests.post(f"{self._base}/v1/audio/speech", json=body, stream=stream, timeout=300)
+        try:
+            r = _session.post(f"{self._base}/v1/audio/speech", json=body,
+                              stream=stream, timeout=300)
+        except requests.RequestException as e:
+            # Backend unreachable (e.g. it restarted under us). Flip _ready so the
+            # next request re-probes and re-syncs the voice list, then surface a
+            # clean 502 instead of a raw, unmapped 500.
+            self._ready = False
+            raise BackendError(502, f"backend unreachable: {e}")
         if r.status_code == 200:
             return r
         detail = (r.text or "")[:300]
@@ -328,7 +352,8 @@ class VLLMEngine:
         self.load()
         body = self._build_body(text, voice, params, ref_audio, ref_text, stream=False)
         r = self._post(body, stream=False)
-        audio = _pcm_to_f32(r.content)
+        buf = r.content
+        audio = _pcm_to_f32(buf[: len(buf) - (len(buf) % 2)])   # whole int16 samples only
         ext = BreathingExtender(self._sr, self._gap_ms(params))
         out = ext.feed(audio)
         tail = ext.flush()
@@ -339,11 +364,22 @@ class VLLMEngine:
                         ref_text: Optional[str] = None) -> Iterator[np.ndarray]:
         """Stream vLLM-Omni's PCM as it renders, extending sentence pauses to the
         configured breathing target on the fly. No GPU lock — vLLM handles
-        concurrency, so multiple streams run in parallel."""
+        concurrency, so multiple streams run in parallel.
+
+        The upstream request is opened and its status validated EAGERLY here (not
+        lazily inside the returned generator): load(), _build_body() and the
+        first _post() all run before we return, so a backend 4xx/5xx, an unknown
+        voice, or an unreachable backend raises *now* — while the caller can
+        still turn it into a real HTTP status, before StreamingResponse flushes
+        its 200. (A failure that only happens mid-stream still can't change the
+        already-sent status; that's unavoidable.)"""
         self.load()
         body = self._build_body(text, voice, params, ref_audio, ref_text, stream=True)
-        ext = BreathingExtender(self._sr, self._gap_ms(params))
-        r = self._post(body, stream=True)
+        r = self._post(body, stream=True)                  # validates status synchronously
+        return self._iter_stream(r, self._gap_ms(params))
+
+    def _iter_stream(self, r, gap_ms: int) -> Iterator[np.ndarray]:
+        ext = BreathingExtender(self._sr, gap_ms)
         try:
             rem = b""
             for chunk in r.iter_content(4096):
