@@ -1,0 +1,13 @@
+{
+  "host": "0.0.0.0",
+  "port": 8765,
+  "vllm_url": "http://127.0.0.1:8091",
+  "ref_max_seconds": 28,
+  "default_voice": "samantha",
+  "api_key": null,
+  "defaults": {
+    "format": "wav",
+    "max_new_tokens": 1024,
+    "stream_sentence_gap_ms": 600
+  }
+}

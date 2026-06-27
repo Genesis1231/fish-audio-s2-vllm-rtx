@@ -1,0 +1,24 @@
+# Fish Studio TTS service — gitignore
+#
+# What stays tracked: server.py, vllm_backend.py, config.*, run scripts, tests/,
+# voices/ (the cloning profiles, incl. .wav), and the vendored fish_speech/ (the
+# backend's DAC codec). Weights live in ../models and are ignored at the repo root.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenv + build caches (regenerable)
+.venv/
+.cache/
+
+# Logs / OS cruft
+*.log
+.DS_Store
+
+# Local checkpoint symlink (real weights are in ../models, ignored at repo root)
+/checkpoints/
+
+# Vendored lib's generated cache
+/fish_speech/text/cmudict_cache.pickle
