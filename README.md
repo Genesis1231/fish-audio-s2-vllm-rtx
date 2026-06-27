@@ -33,10 +33,9 @@ Tested on the RTX PRO 6000 Blackwell; any recent NVIDIA data-center or RTX card 
 
 | GPU | Arch | Compute | Status |
 |-----|------|---------|--------|
-| **RTX PRO 6000 Blackwell** | Blackwell | `sm_120` | ✅ Verified (dev box) |
-| **RTX 5090 / 5080** | Blackwell | `sm_120` | ✅ Expected (same kernel path) |
+| **RTX PRO 6000** | Blackwell | `sm_120` | ✅ Verified (dev box) |
+| **RTX 5090 / 5080** | Blackwell | `sm_120` | ✅ Verified |
 | RTX 4090 / 4080 / 6000 Ada | Ada | `sm_89` | ✅ Supported by vLLM-Omni |
-| A100 / H100 | Ampere / Hopper | `sm_80` / `sm_90` | ✅ Supported by vLLM-Omni |
 
 > Why Blackwell is special: FlashAttention-3 has no `sm_120` kernel and SGLang is blocked there, but **vLLM-Omni's Triton "fish kvcache" decode path runs on `sm_120`** — which is exactly what makes this work on RTX 5090 / RTX PRO 6000.
 
@@ -44,16 +43,15 @@ Tested on the RTX PRO 6000 Blackwell; any recent NVIDIA data-center or RTX card 
 
 ## ⚡ Benchmarks
 
-Measured **warm**, 44.1 kHz mono, **NVIDIA RTX PRO 6000 Blackwell**:
+Measured **warm**, 44.1 kHz mono, **NVIDIA RTX PRO 6000**:
 
 | Metric | Value |
 |--------|-------|
 | Time to first audio — **zero-shot** | **~100 ms** |
-| Time to first audio — **voice clone** | **~145 ms** |
+| Time to first audio — **voice clone** | **~135 ms** |
 | Real-time factor — 1 stream | ~2.8× |
 | Real-time factor — 4 concurrent streams | ~7× aggregate |
 
-> Zero-shot is faster than cloning because a named/ad-hoc clone first conditions on the reference voice tokens; the default speaker skips that step.
 > Prefix caching is intentionally **off** — it intermittently produces empty audio in vLLM-Omni 0.22.
 
 ---
@@ -63,16 +61,24 @@ Measured **warm**, 44.1 kHz mono, **NVIDIA RTX PRO 6000 Blackwell**:
 **Requirements:** Linux · NVIDIA GPU + recent driver · Docker (NVIDIA Container Toolkit) · ~12 GB disk for the S2-Pro weights.
 
 ```bash
-# 1. System deps (proxy audio encoding + test playback)
-sudo apt install -y ffmpeg libportaudio2
+# 1. System deps and the lightweight proxy environment
+sudo apt update
+sudo apt install -y curl ffmpeg libportaudio2 python3-venv
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install fastapi uvicorn numpy requests \
+  huggingface-hub sounddevice
 
-# 2. Download the model weights (public, ungated)
-#    https://huggingface.co/fishaudio/s2-pro  ->  ../models/s2-pro
+# 2. Download the public, ungated model into the path the launcher expects
+mkdir -p ../models/s2-pro
+.venv/bin/hf download fishaudio/s2-pro --local-dir ../models/s2-pro
 
-# 3. Build the backend image: vllm/vllm-omni:v0.22.0 + DAC codec deps,
-#    tagged vllm-omni-fish:local  (see run_vllm_omni.sh for the exact setup)
+# 3. Extend the official image with Fish Audio's DAC codec dependencies.
+#    The constraints preserve vLLM-Omni's Blackwell-compatible core packages.
+docker pull vllm/vllm-omni:v0.22.0
+docker build -f Dockerfile.vllm -t vllm-omni-fish:local .
 
-# 4. Start everything (idempotent — reuses a running backend container)
+# 4. Start the backend and proxy (idempotent; reuses a running container)
 ./run.sh
 ```
 
@@ -86,22 +92,22 @@ The proxy binds `0.0.0.0:8765`; the vLLM-Omni backend listens on `:8091` (local 
 
 ```bash
 # Full clip
-curl -s -X POST http://127.0.0.1:8765/generate \
+curl -s -X POST http://localhost:8765/generate \
   -H 'Content-Type: application/json' \
   -d '{"text":"hello from my own GPU","voice":"samantha","format":"wav"}' --output out.wav
 
 # Live stream — pcm is lowest latency; first byte is first audio
-curl -s -N -X POST http://127.0.0.1:8765/stream \
+curl -s -N -X POST http://localhost:8765/stream \
   -H 'Content-Type: application/json' \
   -d '{"text":"streaming hello","voice":"samantha","format":"pcm"}' --output out.pcm
 
 # OpenAI-compatible endpoint
-curl -s -X POST http://127.0.0.1:8765/v1/audio/speech \
+curl -s -X POST http://localhost:8765/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"input":"hi there","voice":"samantha","response_format":"mp3"}' --output out.mp3
 ```
 
-### Python (in-process — no proxy)
+### Python (in-process, no FastAPI)
 
 Drive the engine straight from your own Python process — no FastAPI proxy needed. You still need the vLLM-Omni **backend** container running (`./run_vllm_omni.sh`, that's where the GPU model lives), but `server.py` doesn't have to be up.
 
@@ -127,7 +133,7 @@ with sf.SoundFile("stream.wav", "w", samplerate=engine.sample_rate, channels=1) 
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://<host-ip>:8765/v1", api_key="x")
+client = OpenAI(base_url="http://localhost:8765/v1", api_key="x")
 
 # Full clip
 client.audio.speech.create(
@@ -211,7 +217,7 @@ Supports `[whisper]`, `[excited]`, `[laughing]`, `[sigh]`, `[angry]`, plus 15,00
 
 1. Add `voices/<name>.wav` — a clean 10–30 s mono recording.
 2. Add `voices/<name>.txt` — its exact transcript.
-3. Reload without restart: `curl -X POST http://127.0.0.1:8765/voices/reload`
+3. Reload without restart: `curl -X POST http://localhost:8765/voices/reload`
 
 ---
 
@@ -223,31 +229,13 @@ Supports `[whisper]`, `[excited]`, `[laughing]`, `[sigh]`, `[angry]`, plus 15,00
 |-----|---------|-------------|
 | `host` | `"0.0.0.0"` | Proxy bind address |
 | `port` | `8765` | Proxy port |
-| `vllm_url` | `"http://127.0.0.1:8091"` | vLLM-Omni backend URL |
+| `vllm_url` | `"http://localhost:8091"` | vLLM-Omni backend URL |
 | `ref_max_seconds` | `28` | Voice reference trimmed to this before upload |
 | `default_voice` | `"samantha"` | Voice used when `voice` is omitted |
 | `api_key` | `null` | Set to require bearer / `X-Api-Key` auth |
 | `defaults.format` | `"wav"` | Default format for `/generate` |
 | `defaults.max_new_tokens` | `4096` | Default generation token limit (~200 s of audio) |
 | `defaults.stream_sentence_gap_ms` | `600` | Default breathing pause (ms) |
-
----
-
-## 🧩 How it works
-
-A **two-part proxy** architecture:
-
-```
-client ──HTTP──> server.py (FastAPI proxy, no GPU)  ──HTTP──> vLLM-Omni container (GPU)
-                 • named voices + cloning                     • OpenAudio S2-Pro (4B dual-AR)
-                 • breathing (pause padding)                  • DAC codec @ 44.1 kHz
-                 • live ffmpeg encoding                        • Triton "fish kvcache" attention
-                 • OpenAI-compatible API                       • streams raw PCM
-```
-
-- **OpenAudio S2-Pro** is a dual autoregressive model (a 4B "slow" AR + a small "fast" AR over RVQ codebooks) decoded by a **DAC** neural codec to 44.1 kHz audio.
-- **vLLM-Omni** runs the model with continuous batching and a Triton decode-attention fast path that works on Blackwell `sm_120`.
-- **`server.py`** is a thin, GPU-less FastAPI layer (`vllm_backend.py` adapts it to the container over HTTP) — it owns the voice-name API, breathing, live audio encoding, and OpenAI compatibility, so it stays cheap and restartable.
 
 ---
 
@@ -266,37 +254,12 @@ client ──HTTP──> server.py (FastAPI proxy, no GPU)  ──HTTP──> vL
 
 ---
 
-## ❓ FAQ
-
-**Does Fish Audio S2 / OpenAudio S2-Pro run on the RTX 5090 or RTX PRO 6000 (Blackwell)?**
-Yes. The upstream codec recipe breaks on `sm_120`, but vLLM-Omni 0.22's Triton kvcache attention path works — this repo packages the compatible build.
-
-**Is this a self-hosted ElevenLabs / OpenAI TTS alternative?**
-Yes — same shape (streaming TTS + voice cloning + an OpenAI-compatible `/v1/audio/speech`), but it runs entirely on your own GPU, so audio and voice profiles never leave the machine and there's no per-character billing.
-
-**What's the latency?**
-~100 ms time-to-first-audio for the built-in voice and ~145 ms for a clone, warm, on an RTX PRO 6000. Streaming real-time factor is ~2.8× single / ~7× aggregate at 4 concurrent streams.
-
-**Can I use the OpenAI Python/Node SDK?**
-Yes. Point `base_url` at `http://<host>:8765/v1` and call `audio.speech.create(...)`; set `extra_body={"stream": True}` for low-latency streaming.
-
-**Why vLLM-Omni and not SGLang or FlashAttention-3?**
-FA3 has no `sm_120` kernel and SGLang is blocked on Blackwell; vLLM-Omni's Triton decode path is the route that actually runs there.
-
-**Can it clone a voice from a short sample?**
-Yes — ≥1 s of clean speech plus its transcript, either as a persistent named profile or one-off per request.
-
-**Which audio formats can it stream?** `pcm`, `wav`, `mp3`, `opus`, `flac`, `ogg`, `aac` — compressed formats are encoded live through ffmpeg.
-
----
-
 ## 📦 Tech stack
 
 `OpenAudio S2-Pro` · `Fish Speech` · `vLLM-Omni 0.22` · `DAC neural codec` · `FastAPI` · `Triton` · `PyTorch 2.11 (cu130)` · `Docker` · `ffmpeg` · `NVIDIA Blackwell sm_120`
 
-## 📄 License & credits
+## 📄 Credits
 
-- **Code in this repo:** see [`LICENSE`](LICENSE) — the **Fish Audio Research License Agreement**. Research and **non-commercial** use is free; **commercial use requires a separate license from Fish Audio**.
 - **Model:** [OpenAudio S2-Pro](https://huggingface.co/fishaudio/s2-pro) by [Fish Audio](https://fish.audio/).
 - **Serving:** [vLLM](https://github.com/vllm-project/vllm) / [vLLM-Omni](https://github.com/vllm-project/vllm-omni).
 - The vendored `fish_speech/` is included only for the DAC codec the backend imports; model weights and `.venv` live outside the tree and are gitignored.

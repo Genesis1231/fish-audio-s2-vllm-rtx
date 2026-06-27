@@ -1,0 +1,12 @@
+FROM vllm/vllm-omni:v0.22.0
+
+RUN printf '%s\n' \
+      'torch==2.11.0' \
+      'torchaudio==2.11.0' \
+      'transformers==5.8.1' \
+      > /tmp/vllm-constraints.txt \
+    && uv pip install --system --no-cache-dir \
+      --constraint /tmp/vllm-constraints.txt \
+      descript-audio-codec==1.0.0 \
+    && uv pip install --system --no-cache-dir 'protobuf>=3.20,<6' \
+    && rm /tmp/vllm-constraints.txt

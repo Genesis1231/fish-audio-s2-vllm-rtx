@@ -1,0 +1,3 @@
+# This image extends a published base and copies no project files.
+*
+!Dockerfile.vllm
