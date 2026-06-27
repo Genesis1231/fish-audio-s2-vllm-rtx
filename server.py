@@ -130,9 +130,9 @@ class SpeakBody(BaseModel):
     text: str
     voice: Optional[str] = None             # named profile; None -> default; "" -> zero-shot
     format: Optional[str] = None            # wav|pcm|mp3|opus|flac|ogg|aac
-    max_new_tokens: Optional[int] = None
-    stream_sentence_gap_ms: Optional[int] = None       # breathing: pad inter-sentence pauses to this (ms)
-    initial_codec_chunk_frames: Optional[int] = None   # vLLM TTFA knob (smaller = lower first-audio)
+    max_new_tokens: Optional[int] = Field(default=None, ge=1, le=32768)
+    stream_sentence_gap_ms: Optional[int] = Field(default=None, ge=0, le=5000)      # breathing pause (ms); capped to bound the silence buffer
+    initial_codec_chunk_frames: Optional[int] = Field(default=None, ge=1, le=2048)  # vLLM TTFA knob (smaller = lower first-audio)
     speed: Optional[float] = Field(default=None, ge=0.25, le=4.0)   # speech rate
     seed: Optional[int] = None
     reference_audio: Optional[str] = None   # base64 wav for ad-hoc cloning
@@ -357,7 +357,7 @@ def root():
 def health():
     # Readiness probe: 503 until the backend is reachable + voices synced, so
     # load balancers / monitors don't route to an instance that can't generate.
-    ready = engine.ready
+    ready = engine.check_ready()       # live probe (short-cached), not just the startup flag
     payload = {
         "ok": ready,
         "ready": ready,
@@ -378,7 +378,7 @@ def voices():
 
 
 @app.post("/voices/reload")
-def voices_reload(_=Depends(require_key)):
+def voices_reload(_=Depends(require_key), __=Depends(require_backend)):
     return {"voices": engine.reload_voices(), "default": DEFAULT_VOICE}
 
 

@@ -31,6 +31,7 @@ from config import DEFAULT_VOICE, REF_MAX_SECONDS, VLLM_URL, VOICES_DIR, logger
 
 SAMPLE_RATE = 44100          # s2-pro DAC output
 _DEFAULT_GAP_MS = 600        # fallback breathing target if not in params/config
+_MAX_GAP_MS = 5000           # hard cap on a breathing pause (bounds the np.zeros silence buffer)
 
 # One pooled HTTP session for all backend calls: keep-alive avoids a fresh TCP
 # connect (and a TIME_WAIT socket) per request, which matters once several
@@ -166,6 +167,7 @@ class VLLMEngine:
         self._lock = threading.Lock()                     # guards one-time load/voice-sync
         self._ready = False
         self._load_time: Optional[float] = None
+        self._last_probe = 0.0                             # ts of last good /health probe (cache)
 
     # ---- lifecycle -------------------------------------------------------
     def load(self) -> float:
@@ -191,12 +193,34 @@ class VLLMEngine:
             if self._ready:                    # another request synced while we probed
                 return 0.0
             self._load_local_voices()
-            self._sync_voices()
+            try:
+                self._sync_voices()
+            except BackendError as e:
+                # backend vanished between the probe and the voice sync: keep the
+                # last known voice list, report unready (503) rather than a 502.
+                raise RuntimeError(f"backend voice sync failed: {e.detail}")
             self._ready = True
             self._load_time = time.time() - t0
             logger.info("vLLM backend ready in %.1fs (voices: %s)",
                         self._load_time, ", ".join(self.list_voices()) or "none")
             return self._load_time
+
+    def check_ready(self, max_age: float = 2.0) -> bool:
+        """Live readiness for /health: reuse a recent good probe for up to
+        ``max_age`` seconds, else GET /v1/models. On failure flip _ready so the
+        next request re-probes + re-syncs — /health stops reporting green after
+        the backend dies post-startup."""
+        if not self._ready:
+            return False
+        if time.time() - self._last_probe < max_age:
+            return True
+        try:
+            _session.get(f"{self._base}/v1/models", timeout=3).raise_for_status()
+            self._last_probe = time.time()
+            return True
+        except Exception:
+            self._ready = False
+            return False
 
     def warm_up(self) -> None:
         """Prime the backend (clears its one-time Triton JIT spike) using the
@@ -240,12 +264,15 @@ class VLLMEngine:
                 self._voices[wav.stem] = (wav.read_bytes(), txt.read_text().strip())
 
     def _vllm_voice_names(self) -> set:
+        # Raise (not return empty) on failure: "backend has no voices" and
+        # "backend unreachable" are different states — the caller must not wipe
+        # the known-good voice list just because it couldn't ask.
         try:
             r = _session.get(f"{self._base}/v1/audio/voices", timeout=10)
             r.raise_for_status()
             return set(r.json().get("voices", []))
-        except Exception:
-            return set()
+        except Exception as e:
+            raise BackendError(502, f"could not list backend voices: {e}")
 
     def _delete_voice(self, name: str) -> None:
         try:
@@ -267,7 +294,10 @@ class VLLMEngine:
             if name in have and not replace:
                 available.add(name)                    # already uploaded; trust it
                 continue
-            if name in have:                           # replace: drop the stale one first
+            # Duplicate-name POSTs overwrite in place. Keep this best-effort
+            # DELETE as cache hygiene in case the backend retains a name-keyed
+            # inference artifact; POST below remains the authoritative update.
+            if name in have:
                 self._delete_voice(name)
             wav, rtext = _trim_ref(wav_bytes, text, REF_MAX_SECONDS)
             try:
@@ -301,7 +331,8 @@ class VLLMEngine:
     # ---- request building ------------------------------------------------
     def _gap_ms(self, params: dict) -> int:
         v = params.get("stream_sentence_gap_ms")
-        return int(v) if v is not None else _DEFAULT_GAP_MS
+        g = int(v) if v is not None else _DEFAULT_GAP_MS
+        return max(0, min(g, _MAX_GAP_MS))     # clamp; also guards config defaults Pydantic can't see
 
     def _build_body(self, text, voice, params, ref_audio, ref_text, stream) -> dict:
         body = {"input": text, "response_format": "pcm", "stream": stream}
@@ -340,9 +371,13 @@ class VLLMEngine:
         if r.status_code == 200:
             return r
         detail = (r.text or "")[:300]
-        # Mirror the backend: a bad request (4xx, e.g. ref too short) stays 4xx;
-        # an upstream failure (5xx) becomes 502 Bad Gateway.
-        raise BackendError(r.status_code if 400 <= r.status_code < 500 else 502, detail)
+        # A bad request (4xx, e.g. ref too short) stays 4xx. A 5xx is an upstream
+        # failure — and can mean the backend restarted under us, so flip _ready to
+        # force a re-probe + voice re-sync on the next request.
+        if r.status_code >= 500:
+            self._ready = False
+            raise BackendError(502, detail)
+        raise BackendError(r.status_code, detail)
 
     # ---- generation ------------------------------------------------------
     def generate(self, text: str, voice: Optional[str] = DEFAULT_VOICE,
